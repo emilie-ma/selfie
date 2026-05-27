@@ -18,6 +18,11 @@ struct selfieTests {
         #expect(SnapchatCameraTuning.beautyProcessingLongEdge <= 2048)
     }
 
+    @Test func skinTextureRetentionIsSubtle() {
+        #expect(SnapchatCameraTuning.skinTextureRetention >= 0.45)
+        #expect(SnapchatCameraTuning.skinTextureRetention <= 0.75)
+    }
+
     @Test func photoBeautyProcessorReturnsJPEG() {
         let size = CGSize(width: 400, height: 600)
         let renderer = UIGraphicsImageRenderer(size: size)

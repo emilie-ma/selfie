@@ -37,7 +37,6 @@ class CameraViewModel: NSObject, ObservableObject {
     @Published var ringLightIntensity: Double = 0.88
     @Published var ringLightShade: RingLightShade = .neutral
     @Published var showFlashSettingsPanel = false
-    @Published var frontFlashStyle: FrontFlashStyle = .ring
     @Published var dualCameraEnabled = false
     /// When true, front camera is full-screen and back is PiP (Snapchat flip).
     @Published var dualCameraLayoutSwapped = false
@@ -70,6 +69,60 @@ class CameraViewModel: NSObject, ObservableObject {
     private let maxRecordingDuration: TimeInterval = 60
     private var isPhotoCaptureInProgress = false
     private var photoCaptureTimeoutWorkItem: DispatchWorkItem?
+    private var sessionObserversInstalled = false
+
+    override init() {
+        super.init()
+        installSessionObservers()
+    }
+
+    private func installSessionObservers() {
+        guard !sessionObserversInstalled else { return }
+        sessionObserversInstalled = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSessionRuntimeError(_:)),
+            name: .AVCaptureSessionRuntimeError,
+            object: session
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSessionInterrupted(_:)),
+            name: .AVCaptureSessionWasInterrupted,
+            object: session
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSessionInterruptionEnded(_:)),
+            name: .AVCaptureSessionInterruptionEnded,
+            object: session
+        )
+    }
+
+    @objc private func handleSessionRuntimeError(_ notification: Notification) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if self.isDualCameraActive { return }
+            if self.session.isRunning { self.session.stopRunning() }
+            self.configureSession()
+        }
+    }
+
+    @objc private func handleSessionInterrupted(_ notification: Notification) {
+        DispatchQueue.main.async {
+            self.isCameraReady = false
+        }
+    }
+
+    @objc private func handleSessionInterruptionEnded(_ notification: Notification) {
+        sessionQueue.async { [weak self] in
+            guard let self, !self.isDualCameraActive else { return }
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+            self.refreshCameraReadyState()
+        }
+    }
 
     var activeSession: AVCaptureSession {
         if dualCameraEnabled, isDualCameraActive, let multi = multiCamSession { return multi }
@@ -95,7 +148,6 @@ class CameraViewModel: NSObject, ObservableObject {
 
     var shouldShowRingLightOverlay: Bool {
         ringLightEnabled
-            && frontFlashStyle == .ring
             && (isUsingFrontCamera || (dualCameraEnabled && isDualCameraActive))
     }
 
@@ -135,6 +187,19 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     // MARK: - Permissions & Setup
+    func restartCamera() {
+        cameraStatusMessage = nil
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if self.isDualCameraActive, let multi = self.multiCamSession {
+                if !multi.isRunning { multi.startRunning() }
+                self.refreshCameraReadyState()
+            } else {
+                self.configureSession()
+            }
+        }
+    }
+
     func requestPermissions() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -176,6 +241,10 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     private func configureSession() {
+        if session.isRunning {
+            session.stopRunning()
+        }
+
         session.beginConfiguration()
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
@@ -194,33 +263,76 @@ class CameraViewModel: NSObject, ObservableObject {
             return
         }
 
-        if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
-        if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
+        if session.canAddOutput(photoOutput) {
+            session.addOutput(photoOutput)
+        }
+        if session.canAddOutput(movieOutput) {
+            session.addOutput(movieOutput)
+        }
 
         configurePhotoOutput(photoOutput)
+        applyMirroring()
+        session.commitConfiguration()
+
         if isUsingFrontCamera, let device = videoInput?.device {
             applySnapchatFrontCameraSettings(to: device)
         }
-        applyMirroring()
-        session.commitConfiguration()
-        session.startRunning()
 
-        DispatchQueue.main.async {
-            self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
-            if self.isUsingFrontCamera {
-                self.currentZoom = SnapchatCameraTuning.frontCameraZoomFactor
-                self.baseZoom = SnapchatCameraTuning.frontCameraZoomFactor
-            }
-            if self.isCameraReady {
-                self.cameraStatusMessage = nil
+        session.startRunning()
+        refreshCameraReadyState()
+    }
+
+    /// Polls until the capture session and photo output are actually ready (avoids false "failed to start").
+    private func refreshCameraReadyState(retry: Int = 0) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            let targetSession: AVCaptureSession
+            if self.isDualCameraActive, let multi = self.multiCamSession {
+                targetSession = multi
             } else {
-                #if targetEnvironment(simulator)
-                self.cameraStatusMessage = "The iOS Simulator has no camera. Connect a real iPhone to test the camera, or import a photo below to demo the app."
-                #else
-                self.cameraStatusMessage = "Camera failed to start."
-                #endif
+                targetSession = self.session
             }
-            self.applyRingLightScreenBoost()
+
+            let running = targetSession.isRunning
+            let photoReady = self.hasPhotoOutputReady()
+
+            if running && photoReady {
+                DispatchQueue.main.async {
+                    self.isCameraReady = true
+                    self.cameraStatusMessage = nil
+                    if self.isUsingFrontCamera {
+                        self.currentZoom = SnapchatCameraTuning.frontCameraZoomFactor
+                        self.baseZoom = SnapchatCameraTuning.frontCameraZoomFactor
+                    }
+                    self.applyRingLightScreenBoost()
+                }
+                return
+            }
+
+            if retry < 30 {
+                if !running, !self.isDualCameraActive {
+                    targetSession.startRunning()
+                }
+                self.sessionQueue.asyncAfter(deadline: .now() + 0.1) {
+                    self.refreshCameraReadyState(retry: retry + 1)
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.isCameraReady = running && photoReady
+                if self.isCameraReady {
+                    self.cameraStatusMessage = nil
+                    self.applyRingLightScreenBoost()
+                } else {
+                    #if targetEnvironment(simulator)
+                    self.cameraStatusMessage = "The iOS Simulator has no camera. Connect a real iPhone to test the camera, or import a photo below to demo the app."
+                    #else
+                    self.cameraStatusMessage = "Camera failed to start. Close other camera apps and reopen Selfie."
+                    #endif
+                }
+            }
         }
     }
 
@@ -283,9 +395,6 @@ class CameraViewModel: NSObject, ObservableObject {
     func toggleFlashControl() {
         if usesFrontRingLight {
             ringLightEnabled.toggle()
-            if ringLightEnabled {
-                frontFlashStyle = .ring
-            }
             applyRingLightScreenBoost()
         } else {
             toggleFlash()
@@ -305,15 +414,6 @@ class CameraViewModel: NSObject, ObservableObject {
     func selectRingLightShade(_ shade: RingLightShade) {
         ringLightShade = shade
         ringLightEnabled = true
-        frontFlashStyle = .ring
-        applyRingLightScreenBoost()
-    }
-
-    func setFrontFlashStyle(_ style: FrontFlashStyle) {
-        frontFlashStyle = style
-        if style == .ring {
-            ringLightEnabled = true
-        }
         applyRingLightScreenBoost()
     }
 
@@ -465,9 +565,7 @@ class CameraViewModel: NSObject, ObservableObject {
                 }
             }
             multi.commitConfiguration()
-            DispatchQueue.main.async {
-                self.isCameraReady = self.hasActivePhotoConnection()
-            }
+            self.refreshCameraReadyState()
         }
     }
 
@@ -593,9 +691,9 @@ class CameraViewModel: NSObject, ObservableObject {
             self.currentZoom = 1.0
             self.baseZoom = 1.0
             self.previewSessionID = UUID()
-            self.isCameraReady = self.hasActivePhotoConnection()
             self.applyRingLightScreenBoost()
         }
+        refreshCameraReadyState()
     }
 
     private func finishDualCameraFailure(message: String? = nil) {
@@ -622,7 +720,6 @@ class CameraViewModel: NSObject, ObservableObject {
                     }
                 }
             }
-            self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
         }
     }
 
@@ -645,7 +742,6 @@ class CameraViewModel: NSObject, ObservableObject {
             self.backCameraPort = nil
             self.frontCameraPort = nil
             self.previewSessionID = UUID()
-            self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
             self.applyRingLightScreenBoost()
         }
     }
@@ -738,6 +834,10 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     private func reconfigureSingleSession() {
+        if session.isRunning {
+            session.stopRunning()
+        }
+
         session.beginConfiguration()
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
@@ -745,30 +845,34 @@ class CameraViewModel: NSObject, ObservableObject {
 
         guard addVideoInput(to: session, position: isUsingFrontCamera ? .front : .back) else {
             session.commitConfiguration()
+            DispatchQueue.main.async { self.isCameraReady = false }
             return
         }
         if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
         configurePhotoOutput(photoOutput)
+        applyMirroring()
+        session.commitConfiguration()
+
         if isUsingFrontCamera, let device = videoInput?.device {
             applySnapchatFrontCameraSettings(to: device)
         }
-        applyMirroring()
-        session.commitConfiguration()
+
         session.startRunning()
-        DispatchQueue.main.async {
-            self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
-            if self.isUsingFrontCamera {
-                self.currentZoom = SnapchatCameraTuning.frontCameraZoomFactor
-                self.baseZoom = SnapchatCameraTuning.frontCameraZoomFactor
-            }
+        refreshCameraReadyState()
+    }
+
+    private func hasPhotoOutputReady() -> Bool {
+        let output = activePhotoOutput
+        if let connection = output.connection(with: .video) {
+            return connection.isEnabled
         }
+        return output.connections.contains { $0.isEnabled }
     }
 
     private func hasActivePhotoConnection() -> Bool {
         guard activeSession.isRunning else { return false }
-        guard let connection = activePhotoOutput.connection(with: .video) else { return false }
-        return connection.isEnabled
+        return hasPhotoOutputReady()
     }
 
     // MARK: - Capture Photo
@@ -871,16 +975,7 @@ class CameraViewModel: NSObject, ObservableObject {
                 return
             }
 
-            let useScreenFlash = self.shouldShowRingLightOverlay == false
-                && self.ringLightEnabled
-                && self.frontFlashStyle == .regular
-                && self.usesFrontRingLight
-
-            if useScreenFlash {
-                DispatchQueue.main.async { self.showScreenFlash = true }
-            }
-
-            let captureDelay: TimeInterval = useScreenFlash ? 0.1 : 0
+            let captureDelay: TimeInterval = 0
             self.sessionQueue.asyncAfter(deadline: .now() + captureDelay) { [weak self] in
                 guard let self else {
                     DispatchQueue.main.async { completion(nil) }
@@ -1029,6 +1124,10 @@ class CameraViewModel: NSObject, ObservableObject {
         applyRingLightScreenBoost()
 
         sessionQueue.async {
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+
             self.session.beginConfiguration()
             if let currentInput = self.videoInput {
                 self.session.removeInput(currentInput)
@@ -1039,12 +1138,17 @@ class CameraViewModel: NSObject, ObservableObject {
                 let newInput = try? AVCaptureDeviceInput(device: device)
             else {
                 self.session.commitConfiguration()
+                self.session.startRunning()
+                self.refreshCameraReadyState()
                 return
             }
             if self.session.canAddInput(newInput) {
                 self.session.addInput(newInput)
                 self.videoInput = newInput
             }
+            self.applyMirroring()
+            self.session.commitConfiguration()
+
             if self.isUsingFrontCamera {
                 self.applySnapchatFrontCameraSettings(to: device)
             } else {
@@ -1054,8 +1158,10 @@ class CameraViewModel: NSObject, ObservableObject {
                     device.unlockForConfiguration()
                 } catch {}
             }
-            self.applyMirroring()
-            self.session.commitConfiguration()
+
+            self.session.startRunning()
+            self.refreshCameraReadyState()
+
             DispatchQueue.main.async {
                 let zoom: CGFloat = self.isUsingFrontCamera
                     ? SnapchatCameraTuning.frontCameraZoomFactor
@@ -1360,9 +1466,3 @@ enum RingLightShade: String, CaseIterable, Identifiable {
     }
 }
 
-enum FrontFlashStyle: String, CaseIterable, Identifiable {
-    case regular = "Regular"
-    case ring = "Ring"
-
-    var id: String { rawValue }
-}

@@ -1,7 +1,7 @@
 import CoreImage
 import UIKit
 
-/// Snapchat-style front-camera output. Mirroring comes from AVCapture (isVideoMirrored) — we only bake orientation + beauty.
+/// Snapchat-style front-camera output: neutral color, less pore texture (frequency separation).
 enum PhotoBeautyProcessor {
 
     private static let ciContext: CIContext = {
@@ -24,7 +24,6 @@ enum PhotoBeautyProcessor {
             normalized = renderHorizontallyFlipped(normalized)
         }
 
-        // Downsample before Core Image — largest memory win for full-res captures.
         normalized = downsampleForProcessing(normalized)
 
         guard isFrontCamera else {
@@ -38,7 +37,7 @@ enum PhotoBeautyProcessor {
         return processed.jpegData(compressionQuality: SnapchatCameraTuning.jpegQuality) ?? data
     }
 
-    // MARK: - Snapchat look (Core Image)
+    // MARK: - Snapchat look (texture only, no color grade)
 
     private static func applySnapchatLook(to image: UIImage) -> UIImage? {
         guard var ciImage = CIImage(image: image, options: [.applyOrientationProperty: true]) else { return nil }
@@ -48,17 +47,55 @@ enum PhotoBeautyProcessor {
         }
 
         ciImage = reduceNoise(ciImage)
-        ciImage = softenSkin(ciImage)
-        ciImage = softenShadows(ciImage)
-        ciImage = applyWarmTone(ciImage)
-        ciImage = applyColorGrade(ciImage)
+        ciImage = softenSkinTexture(ciImage)
 
         let outputExtent = ciImage.extent.integral
         guard let cgImage = ciContext.createCGImage(ciImage, from: outputExtent) else { return nil }
         return UIImage(cgImage: cgImage, scale: 1, orientation: .up)
     }
 
-    /// Scales so the longest side ≤ beautyProcessingLongEdge before filter chain runs.
+    /// Frequency separation: blur only removes fine detail; color/luminance base stays intact.
+    private static func softenSkinTexture(_ input: CIImage) -> CIImage {
+        let retention = CGFloat(SnapchatCameraTuning.skinTextureRetention)
+        guard retention < 1.0 else { return input }
+
+        let sigma = SnapchatCameraTuning.smoothBlurRadius
+        guard let blurred = input.applyingGaussianBlur(sigma: sigma).clampedToExtent() else {
+            return input
+        }
+
+        // highPass = original − blurred (texture / pores live here)
+        guard let subtract = CIFilter(name: "CISubtractBlendMode") else { return input }
+        subtract.setValue(input, forKey: kCIInputBackgroundImageKey)
+        subtract.setValue(blurred, forKey: kCIInputImageKey)
+        guard var highPass = subtract.outputImage?.cropped(to: input.extent) else { return input }
+
+        if retention > 0 {
+            guard let scale = CIFilter(name: "CIColorMatrix") else { return input }
+            scale.setValue(highPass, forKey: kCIInputImageKey)
+            scale.setValue(CIVector(x: retention, y: 0, z: 0, w: 0), forKey: "inputRVector")
+            scale.setValue(CIVector(x: 0, y: retention, z: 0, w: 0), forKey: "inputGVector")
+            scale.setValue(CIVector(x: 0, y: 0, z: retention, w: 0), forKey: "inputBVector")
+            scale.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
+            scale.setValue(CIVector(x: 0, y: 0, z: 0, w: 0), forKey: "inputBiasVector")
+            highPass = scale.outputImage?.cropped(to: input.extent) ?? highPass
+        }
+
+        // Recombine: blurred base + attenuated texture
+        guard let add = CIFilter(name: "CIAdditionCompositing") else { return input }
+        add.setValue(highPass, forKey: kCIInputImageKey)
+        add.setValue(blurred, forKey: kCIInputBackgroundImageKey)
+        return add.outputImage?.cropped(to: input.extent) ?? input
+    }
+
+    private static func reduceNoise(_ input: CIImage) -> CIImage {
+        guard let filter = CIFilter(name: "CINoiseReduction") else { return input }
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(SnapchatCameraTuning.noiseLevel, forKey: "inputNoiseLevel")
+        filter.setValue(SnapchatCameraTuning.noiseSharpness, forKey: "inputSharpness")
+        return filter.outputImage?.cropped(to: input.extent) ?? input
+    }
+
     private static func downsampleForProcessing(_ image: UIImage) -> UIImage {
         let maxEdge = SnapchatCameraTuning.beautyProcessingLongEdge
         let pixelW = image.size.width * image.scale
@@ -76,62 +113,6 @@ enum PhotoBeautyProcessor {
         return renderer.image { _ in
             image.draw(in: CGRect(origin: .zero, size: newSize))
         }
-    }
-
-    /// Edge-preserving smooth: blend a blurred copy to kill pore grit while keeping eyes/brows.
-    private static func softenSkin(_ input: CIImage) -> CIImage {
-        let blend = CGFloat(SnapchatCameraTuning.skinSmoothBlend)
-        guard blend > 0 else { return input }
-
-        let radius = SnapchatCameraTuning.smoothBlurRadius
-        guard let blurred = input.applyingGaussianBlur(sigma: radius).clampedToExtent() else {
-            return input
-        }
-
-        guard let dissolved = CIFilter(name: "CIDissolveTransition") else { return input }
-        dissolved.setValue(input, forKey: kCIInputImageKey)
-        dissolved.setValue(blurred, forKey: kCIInputTargetImageKey)
-        dissolved.setValue(blend, forKey: kCIInputTimeKey)
-        return dissolved.outputImage?.cropped(to: input.extent) ?? input
-    }
-
-    private static func reduceNoise(_ input: CIImage) -> CIImage {
-        guard let filter = CIFilter(name: "CINoiseReduction") else { return input }
-        filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(SnapchatCameraTuning.noiseLevel, forKey: "inputNoiseLevel")
-        filter.setValue(SnapchatCameraTuning.noiseSharpness, forKey: "inputSharpness")
-        return filter.outputImage?.cropped(to: input.extent) ?? input
-    }
-
-    private static func softenShadows(_ input: CIImage) -> CIImage {
-        guard let filter = CIFilter(name: "CIHighlightShadowAdjust") else { return input }
-        filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(SnapchatCameraTuning.localContrastReduction, forKey: "inputShadowAmount")
-        filter.setValue(-0.04, forKey: "inputHighlightAmount")
-        return filter.outputImage?.cropped(to: input.extent) ?? input
-    }
-
-    private static func applyWarmTone(_ input: CIImage) -> CIImage {
-        guard let filter = CIFilter(name: "CITemperatureAndTint") else { return input }
-        filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(
-            CIVector(x: SnapchatCameraTuning.warmthNeutral, y: 0),
-            forKey: "inputNeutral"
-        )
-        filter.setValue(
-            CIVector(x: SnapchatCameraTuning.warmthTarget, y: 0),
-            forKey: "inputTargetNeutral"
-        )
-        return filter.outputImage?.cropped(to: input.extent) ?? input
-    }
-
-    private static func applyColorGrade(_ input: CIImage) -> CIImage {
-        guard let filter = CIFilter(name: "CIColorControls") else { return input }
-        filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(SnapchatCameraTuning.saturation, forKey: kCIInputSaturationKey)
-        filter.setValue(SnapchatCameraTuning.contrast, forKey: kCIInputContrastKey)
-        filter.setValue(SnapchatCameraTuning.brightness, forKey: kCIInputBrightnessKey)
-        return filter.outputImage?.cropped(to: input.extent) ?? input
     }
 
     private static func centerCrop(_ image: CIImage, scale: CGFloat) -> CIImage {

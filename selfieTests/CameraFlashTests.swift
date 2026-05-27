@@ -12,7 +12,6 @@ struct CameraFlashTests {
         let model = CameraViewModel()
         model.dualCameraEnabled = true
         model.ringLightEnabled = true
-        model.frontFlashStyle = .ring
         #expect(model.usesFrontRingLight == true)
     }
 
@@ -20,7 +19,6 @@ struct CameraFlashTests {
         let model = CameraViewModel()
         model.dualCameraEnabled = true
         model.ringLightEnabled = true
-        model.frontFlashStyle = .ring
         model.toggleFlashControl()
         #expect(model.ringLightEnabled == false)
         model.toggleFlashControl()
@@ -37,7 +35,6 @@ struct CameraFlashTests {
         model.dualCameraEnabled = true
         model.toggleFlashControl()
         #expect(model.ringLightEnabled == true)
-        #expect(model.frontFlashStyle == .ring)
     }
 
     @Test @MainActor func dualCameraSwapTogglesLayout() {

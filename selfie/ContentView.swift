@@ -68,7 +68,10 @@ struct ContentView: View {
 
             // Camera setup / permission message
             if let message = cameraModel.cameraStatusMessage, cameraModel.pendingPreview == nil {
-                CameraStatusOverlay(message: message) { data in
+                CameraStatusOverlay(
+                    message: message,
+                    onRetry: { cameraModel.restartCamera() }
+                ) { data in
                     cameraModel.loadDemoPhoto(data: data)
                 }
             }
@@ -605,55 +608,35 @@ struct FlashSettingsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Flash")
+            Text("Ring Light")
                 .font(.subheadline.bold())
                 .foregroundColor(.white)
 
-            HStack(spacing: 20) {
-                ForEach(FrontFlashStyle.allCases) { style in
+            HStack(spacing: 16) {
+                ForEach(RingLightShade.allCases) { shade in
                     Button {
-                        model.setFrontFlashStyle(style)
+                        model.selectRingLightShade(shade)
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     } label: {
-                        VStack(spacing: 4) {
-                            Text(style.rawValue)
-                                .font(.subheadline.weight(model.frontFlashStyle == style ? .bold : .regular))
-                                .foregroundColor(model.frontFlashStyle == style ? .yellow : .gray)
-                            Rectangle()
-                                .fill(model.frontFlashStyle == style ? Color.yellow : Color.clear)
-                                .frame(height: 2)
-                        }
+                        Circle()
+                            .fill(shade.swiftUIColor)
+                            .frame(width: 32, height: 32)
+                            .overlay(
+                                Circle()
+                                    .stroke(
+                                        model.ringLightShade == shade ? Color.white : Color.white.opacity(0.35),
+                                        lineWidth: model.ringLightShade == shade ? 2.5 : 1
+                                    )
+                            )
                     }
                 }
             }
 
-            if model.frontFlashStyle == .ring {
-                HStack(spacing: 16) {
-                    ForEach(RingLightShade.allCases) { shade in
-                        Button {
-                            model.selectRingLightShade(shade)
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        } label: {
-                            Circle()
-                                .fill(shade.swiftUIColor)
-                                .frame(width: 32, height: 32)
-                                .overlay(
-                                    Circle()
-                                        .stroke(
-                                            model.ringLightShade == shade ? Color.white : Color.white.opacity(0.35),
-                                            lineWidth: model.ringLightShade == shade ? 2.5 : 1
-                                        )
-                                )
-                        }
-                    }
+            Slider(value: $model.ringLightIntensity, in: 0.45...1.0)
+                .tint(.white)
+                .onChange(of: model.ringLightIntensity) { _, _ in
+                    model.updateRingLightIntensity()
                 }
-
-                Slider(value: $model.ringLightIntensity, in: 0.45...1.0)
-                    .tint(.white)
-                    .onChange(of: model.ringLightIntensity) { _, _ in
-                        model.updateRingLightIntensity()
-                    }
-            }
         }
         .padding(16)
         .frame(width: 220)
@@ -986,9 +969,16 @@ struct CountdownOverlay: View {
 
 struct CameraStatusOverlay: View {
     let message: String
+    var onRetry: (() -> Void)? = nil
     var onDemoPhoto: ((Data) -> Void)? = nil
 
     @State private var pickedItem: PhotosPickerItem?
+
+    private var showsRetry: Bool {
+        message.localizedCaseInsensitiveContains("failed")
+            || message.localizedCaseInsensitiveContains("busy")
+            || message.localizedCaseInsensitiveContains("try again")
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -998,6 +988,21 @@ struct CameraStatusOverlay: View {
                 .font(.subheadline)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
+
+            if showsRetry, let onRetry {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onRetry()
+                } label: {
+                    Text("Try Again")
+                        .font(.subheadline.bold())
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                        .background(Color.white)
+                        .clipShape(Capsule())
+                }
+            }
 
             #if targetEnvironment(simulator)
             if let onDemoPhoto {

@@ -1,6 +1,6 @@
 import CoreGraphics
 
-/// Tuning constants matched to Snapchat front-camera selfies (closer crop, soft skin, warm tone).
+/// Tuning for Snapchat-style front selfies — texture softening only, no color shift.
 enum SnapchatCameraTuning {
     /// Subtle default front zoom — native FOV with a tiny bump (1.0 = widest).
     static let frontCameraZoomFactor: CGFloat = 1.05
@@ -8,27 +8,15 @@ enum SnapchatCameraTuning {
     /// Center crop applied in post if capture still looks wider than Snap (safety net).
     static let postCaptureCropScale: CGFloat = 1.0
 
-    /// Blend of edge-preserving smooth layer (0 = raw, 1 = full blur).
-    static let skinSmoothBlend: CGFloat = 0.40
+    /// How much fine skin texture to keep after smoothing (1 = original, ~0.55 = Snap-like soft).
+    static let skinTextureRetention: CGFloat = 0.58
 
-    /// Gaussian sigma for skin-softening layer.
-    static let smoothBlurRadius: CGFloat = 2.6
+    /// Gaussian sigma for the low-frequency (smooth) layer in frequency separation.
+    static let smoothBlurRadius: CGFloat = 2.0
 
-    /// CINoiseReduction — lowers grit/grain from the sensor.
-    static let noiseLevel: Float = 0.012
-    static let noiseSharpness: Float = 0.32
-
-    /// Warmer, slightly lifted tones (Snapchat indoor selfie look).
-    static let saturation: Float = 1.05
-    static let contrast: Float = 0.92
-    static let brightness: Float = 0.035
-
-    /// Neutral → target for CITemperatureAndTint (higher neutral K = warmer result).
-    static let warmthNeutral: CGFloat = 6800
-    static let warmthTarget: CGFloat = 6000
-
-    /// Soft local contrast — reduces pore/texture emphasis.
-    static let localContrastReduction: CGFloat = 0.22
+    /// Very light sensor noise cleanup — keeps color neutral.
+    static let noiseLevel: Float = 0.006
+    static let noiseSharpness: Float = 0.40
 
     static let jpegQuality: CGFloat = 0.91
 
