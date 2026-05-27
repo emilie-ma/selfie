@@ -7,7 +7,6 @@ import PhotosUI
 // MARK: - Root View
 struct ContentView: View {
     @StateObject private var cameraModel = CameraViewModel()
-    @Environment(\.scenePhase) private var scenePhase
     @State private var showGallery = false
     @AppStorage("defaultSaveOption") private var defaultSaveOptionRaw = SaveDestinationOption.both.rawValue
 
@@ -15,6 +14,7 @@ struct ContentView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
+            // Camera preview
             CameraPreviewContainer(model: cameraModel)
                 .ignoresSafeArea()
                 .simultaneousGesture(
@@ -29,20 +29,22 @@ struct ContentView: View {
                         .onChanged { cameraModel.zoom(factor: $0) }
                         .onEnded { _ in cameraModel.commitZoom(factor: 1) }
                 )
-                .onTapGesture(count: 2) { cameraModel.flipCamera() }
+                .onTapGesture(count: 2) {
+                    cameraModel.flipCamera()
+                }
                 .onTapGesture(count: 1, coordinateSpace: .local) { location in
                     cameraModel.focus(at: location)
                 }
 
+            // Grid overlay
             if cameraModel.showGrid {
                 GridOverlayView()
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
             }
 
-            if cameraModel.ringLightEnabled,
-               cameraModel.isUsingFrontCamera,
-               cameraModel.frontFlashStyle == .ring {
+            // Ring light overlay (selfie + dual-cam front face)
+            if cameraModel.shouldShowRingLightOverlay {
                 RingLightOverlay(
                     shade: cameraModel.ringLightShade,
                     intensity: cameraModel.ringLightIntensity
@@ -51,6 +53,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
+            // Brief full-screen flash only for Regular front-flash mode at capture
             if cameraModel.showScreenFlash {
                 Color.white
                     .ignoresSafeArea()
@@ -58,16 +61,19 @@ struct ContentView: View {
                     .transition(.opacity)
             }
 
+            // Countdown overlay
             if let countdown = cameraModel.countdownValue {
                 CountdownOverlay(value: countdown)
             }
 
+            // Camera setup / permission message
             if let message = cameraModel.cameraStatusMessage, cameraModel.pendingPreview == nil {
                 CameraStatusOverlay(message: message) { data in
                     cameraModel.loadDemoPhoto(data: data)
                 }
             }
 
+            // Main UI (hidden during capture preview)
             if cameraModel.pendingPreview == nil {
                 VStack(spacing: 0) {
                     TopBarView(model: cameraModel)
@@ -75,7 +81,8 @@ struct ContentView: View {
                     BottomBarView(model: cameraModel, showGallery: $showGallery)
                 }
 
-                if cameraModel.showFlashSettingsPanel && cameraModel.isUsingFrontCamera {
+                // Flash settings popup (top-right, Snapchat style)
+                if cameraModel.showFlashSettingsPanel && cameraModel.usesFrontRingLight {
                     FlashSettingsPanel(model: cameraModel)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                         .padding(.top, 88)
@@ -84,6 +91,19 @@ struct ContentView: View {
                         .zIndex(20)
                 }
 
+                if cameraModel.showFlashSettingsPanel {
+                    VStack {
+                        Spacer()
+                        Text("Tap anywhere on Camera to dismiss")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.55))
+                            .padding(.bottom, 130)
+                    }
+                    .allowsHitTesting(false)
+                    .zIndex(19)
+                }
+
+                // Right sidebar controls (Snapchat style)
                 HStack {
                     Spacer()
                     RightSidebarView(model: cameraModel)
@@ -91,6 +111,7 @@ struct ContentView: View {
                 }
             }
 
+            // Zoom indicator
             if cameraModel.showZoomLabel {
                 VStack {
                     Spacer()
@@ -105,6 +126,7 @@ struct ContentView: View {
                 }
             }
 
+            // Brief processing — avoids showing raw capture that flips when beauty pass finishes
             if cameraModel.isProcessingCapture {
                 ZStack {
                     Color.black.opacity(0.35).ignoresSafeArea()
@@ -116,14 +138,19 @@ struct ContentView: View {
                 .zIndex(150)
             }
 
+            // Post-capture preview (Snapchat save flow)
             if let pending = cameraModel.pendingPreview {
                 CapturePreviewView(
                     pending: pending,
                     defaultSaveOptionRaw: $defaultSaveOptionRaw,
                     onSave: { destination in
-                        Task { await cameraModel.savePendingCapture(to: destination) }
+                        Task {
+                            await cameraModel.savePendingCapture(to: destination)
+                        }
                     },
-                    onDiscard: { cameraModel.discardPendingCapture() }
+                    onDiscard: {
+                        cameraModel.discardPendingCapture()
+                    }
                 )
                 .zIndex(200)
                 .transition(.opacity)
@@ -140,15 +167,11 @@ struct ContentView: View {
                 cameraModel.lastCapturedMedia = last
             }
         }
-        .onChange(of: scenePhase) { _, phase in
-            switch phase {
-            case .active:
-                cameraModel.requestPermissions()
-            case .background:
+        .onChange(of: cameraModel.shouldShowRingLightOverlay) { _, isOn in
+            if isOn {
+                cameraModel.applyRingLightScreenBoost()
+            } else {
                 ScreenFlashController.shared.restore()
-                cameraModel.teardownCaptureResources()
-            default:
-                break
             }
         }
         .onDisappear {
@@ -166,22 +189,24 @@ struct CameraPreviewContainer: View {
         ZStack {
             if model.isReconfiguringSession {
                 Color.black.ignoresSafeArea()
-                ProgressView().tint(.white).scaleEffect(1.2)
-            } else if model.dualCameraEnabled, model.backCameraPort != nil {
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(1.2)
+            } else if model.dualCameraEnabled, model.dualCamMainPort != nil {
                 PortPreviewView(
                     model: model,
-                    inputPort: model.backCameraPort,
-                    mirrorVideo: false
+                    inputPort: model.dualCamMainPort,
+                    mirrorVideo: model.dualCameraLayoutSwapped
                 )
                 .id(model.previewSessionID)
 
-                if model.frontCameraPort != nil {
+                if model.dualCamPiPPort != nil {
                     VStack {
                         HStack {
                             PortPreviewView(
                                 model: model,
-                                inputPort: model.frontCameraPort,
-                                mirrorVideo: true
+                                inputPort: model.dualCamPiPPort,
+                                mirrorVideo: !model.dualCameraLayoutSwapped
                             )
                             .id("\(model.previewSessionID)-pip")
                             .frame(width: 110, height: 155)
@@ -217,12 +242,12 @@ struct TopBarView: View {
     var body: some View {
         HStack {
             Spacer()
+
             if model.timerMode != .off {
                 ControlButton(icon: model.timerIcon, isActive: true) {
                     model.cycleTimer()
                 }
             }
-            Spacer()
         }
         .padding(.horizontal, 20)
         .padding(.top, 12)
@@ -235,43 +260,60 @@ struct RightSidebarView: View {
 
     var body: some View {
         VStack(spacing: 22) {
-            Spacer()
-                .frame(height: 80)
+            // Flash at top of sidebar (Snapchat layout)
+            VStack(spacing: 10) {
+                Button {
+                    model.toggleFlashControl()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    Image(systemName: model.flashIcon)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(model.isFlashActive ? .black : .white)
+                        .frame(width: 44, height: 44)
+                        .background(model.isFlashActive ? Color.white : Color.clear)
+                        .clipShape(Circle())
+                }
 
-            // Timer
+                if model.usesFrontRingLight {
+                    Button {
+                        model.toggleFlashSettingsPanel()
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(model.showFlashSettingsPanel ? .yellow : .white)
+                            .frame(width: 36, height: 28)
+                    }
+                }
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 6)
+            .background(Color.black.opacity(0.35))
+            .clipShape(Capsule())
+
             SidebarButton(icon: model.timerIcon, label: "Timer", isActive: model.timerMode != .off) {
                 model.cycleTimer()
             }
 
-            // Grid
             SidebarButton(icon: "grid", label: "Grid", isActive: model.showGrid) {
                 model.toggleGrid()
             }
 
-            Button {
-                model.toggleFlashSettingsPanel()
-            } label: {
-                VStack(spacing: 4) {
-                    Image(systemName: model.flashIcon)
-                        .font(.system(size: 22))
-                        .foregroundColor(model.isFlashActive ? .yellow : .white)
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.7))
-                }
-            }
-            .padding(.bottom, 4)
-
-            // Dual camera
             if model.supportsDualCamera {
-                SidebarButton(icon: "camera.on.rectangle.fill", label: "Dual", isActive: model.dualCameraEnabled) {
+                SidebarButton(
+                    icon: "camera.on.rectangle.fill",
+                    label: "Dual",
+                    isActive: model.dualCameraEnabled
+                ) {
                     model.toggleDualCamera()
                 }
+                .opacity(model.isReconfiguringSession ? 0.4 : 1)
+                .disabled(model.isReconfiguringSession)
             }
 
             Spacer()
-                .frame(height: 200)
         }
+        .padding(.top, 56)
     }
 }
 
@@ -307,8 +349,8 @@ struct BottomBarView: View {
                         .frame(width: 48, height: 48)
                         .shadow(color: .black.opacity(0.3), radius: 2)
                 }
-                .disabled(model.dualCameraEnabled)
-                .opacity(model.dualCameraEnabled ? 0.4 : 1)
+                .opacity(model.isReconfiguringSession ? 0.4 : 1)
+                .disabled(model.isReconfiguringSession)
             }
             .padding(.horizontal, 28)
             .padding(.bottom, 36)
@@ -338,10 +380,12 @@ struct ShutterButtonView: View {
                     .rotationEffect(.degrees(-90))
             }
 
+            // Outer ring
             Circle()
                 .stroke(Color.white, lineWidth: 4)
                 .frame(width: shutterSize, height: shutterSize)
 
+            // Inner fill
             RoundedRectangle(cornerRadius: model.isRecording ? 8 : shutterSize / 2)
                 .fill(model.isRecording ? Color.red : Color.white)
                 .frame(
@@ -350,6 +394,7 @@ struct ShutterButtonView: View {
                 )
                 .animation(.spring(response: 0.25), value: model.isRecording)
 
+            // Lock indicator
             if model.isRecording && !model.isRecordingLocked {
                 VStack {
                     Image(systemName: "lock.open.fill")
@@ -407,14 +452,10 @@ struct ShutterButtonView: View {
                     let pressDuration = pressBeganAt.map { Date().timeIntervalSince($0) } ?? 0
                     pressBeganAt = nil
 
-                    if model.isRecordingLocked {
-                        return
-                    }
+                    if model.isRecordingLocked { return }
 
                     if didStartHoldRecording || model.isRecording {
-                        if model.isRecording {
-                            model.stopVideoRecording()
-                        }
+                        if model.isRecording { model.stopVideoRecording() }
                         didStartHoldRecording = false
                     } else if pressDuration < holdThreshold {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -471,116 +512,183 @@ struct CapturePreviewView: View {
                         }
                 }
 
+                // Close — top left, plain white X
                 VStack {
                     HStack {
                         Button(action: onDiscard) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 22, weight: .semibold))
                                 .foregroundColor(.white)
+                                .shadow(color: .black.opacity(0.55), radius: 3, x: 0, y: 1)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                    }
+                    .padding(.leading, 24)
+                    .padding(.top, max(geo.safeAreaInsets.top, 12) + 16)
+                    Spacer()
+                }
+
+                // Download — bottom left, tap save / hold for destination
+                VStack {
+                    Spacer()
+                    HStack(alignment: .bottom) {
+                        ZStack(alignment: .bottomLeading) {
+                            if showSaveMenu {
+                                SaveDestinationMenu { option in
+                                    defaultSaveOptionRaw = option.rawValue
+                                    isSaving = true
+                                    onSave(option.destination)
+                                    showSaveMenu = false
+                                }
+                                .offset(y: -72)
+                                .transition(.scale(scale: 0.92, anchor: .bottomLeading).combined(with: .opacity))
+                                .zIndex(2)
+                            }
+
+                            DownloadSaveControl(isSaving: isSaving) {
+                                guard !isSaving else { return }
+                                isSaving = true
+                                onSave(defaultOption.destination)
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            } onShowOptions: {
+                                UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                                withAnimation(.spring(response: 0.28)) { showSaveMenu = true }
+                            }
                         }
                         Spacer()
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, max(geo.safeAreaInsets.top, 12) + 16)
-
-                    Spacer()
-
-                    SaveDestinationButton(
-                        defaultOption: defaultOption,
-                        isSaving: isSaving,
-                        showSaveMenu: $showSaveMenu,
-                        onSave: { destination in
-                            guard !isSaving else { return }
-                            isSaving = true
-                            defaultSaveOptionRaw = destination.rawValue
-                            onSave(destination.destination)
-                        }
-                    )
+                    .padding(.leading, 28)
                     .padding(.bottom, max(geo.safeAreaInsets.bottom, 16) + 28)
-                }
-
-                if showSaveMenu {
-                    SaveDestinationMenu(
-                        selectedRaw: $defaultSaveOptionRaw,
-                        isSaving: isSaving,
-                        onSelect: { option in
-                            guard !isSaving else { return }
-                            isSaving = true
-                            defaultSaveOptionRaw = option.rawValue
-                            showSaveMenu = false
-                            onSave(option.destination)
-                        }
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .padding(.bottom, max(geo.safeAreaInsets.bottom, 16) + 90)
                 }
             }
         }
         .ignoresSafeArea()
+        .background(Color.black)
     }
 }
 
-struct SaveDestinationButton: View {
-    let defaultOption: SaveDestinationOption
+struct DownloadSaveControl: View {
     let isSaving: Bool
-    @Binding var showSaveMenu: Bool
-    let onSave: (SaveDestinationOption) -> Void
+    let onQuickSave: () -> Void
+    let onShowOptions: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            Button {
-                guard !isSaving else { return }
-                onSave(defaultOption)
-            } label: {
-                Image(systemName: isSaving ? "checkmark" : "arrow.down.to.line")
-                    .font(.title2)
-                    .foregroundColor(.white)
-                    .frame(width: 56, height: 56)
-                    .background(Color.white.opacity(0.2))
-                    .clipShape(Circle())
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: isSaving ? "checkmark" : "arrow.down.to.line")
+                .font(.system(size: 30, weight: .medium))
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.55), radius: 3, x: 0, y: 1)
+                .frame(width: 52, height: 52)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard !isSaving else { return }
+                    onQuickSave()
+                }
+                .onLongPressGesture(minimumDuration: 0.45) {
+                    guard !isSaving else { return }
+                    onShowOptions()
+                }
+
+            Text("Hold for save options")
+                .font(.caption2)
+                .foregroundColor(.white.opacity(0.65))
+                .shadow(color: .black.opacity(0.5), radius: 2)
+        }
+    }
+}
+
+struct FlashSettingsPanel: View {
+    @ObservedObject var model: CameraViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Flash")
+                .font(.subheadline.bold())
+                .foregroundColor(.white)
+
+            HStack(spacing: 20) {
+                ForEach(FrontFlashStyle.allCases) { style in
+                    Button {
+                        model.setFrontFlashStyle(style)
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        VStack(spacing: 4) {
+                            Text(style.rawValue)
+                                .font(.subheadline.weight(model.frontFlashStyle == style ? .bold : .regular))
+                                .foregroundColor(model.frontFlashStyle == style ? .yellow : .gray)
+                            Rectangle()
+                                .fill(model.frontFlashStyle == style ? Color.yellow : Color.clear)
+                                .frame(height: 2)
+                        }
+                    }
+                }
             }
 
-            Button {
-                withAnimation(.spring(response: 0.28)) { showSaveMenu.toggle() }
-            } label: {
-                Image(systemName: "chevron.up")
-                    .font(.caption.bold())
-                    .foregroundColor(.white.opacity(0.8))
+            if model.frontFlashStyle == .ring {
+                HStack(spacing: 16) {
+                    ForEach(RingLightShade.allCases) { shade in
+                        Button {
+                            model.selectRingLightShade(shade)
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Circle()
+                                .fill(shade.swiftUIColor)
+                                .frame(width: 32, height: 32)
+                                .overlay(
+                                    Circle()
+                                        .stroke(
+                                            model.ringLightShade == shade ? Color.white : Color.white.opacity(0.35),
+                                            lineWidth: model.ringLightShade == shade ? 2.5 : 1
+                                        )
+                                )
+                        }
+                    }
+                }
+
+                Slider(value: $model.ringLightIntensity, in: 0.45...1.0)
+                    .tint(.white)
+                    .onChange(of: model.ringLightIntensity) { _, _ in
+                        model.updateRingLightIntensity()
+                    }
             }
         }
+        .padding(16)
+        .frame(width: 220)
+        .background(Color(white: 0.15).opacity(0.92))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 
 struct SaveDestinationMenu: View {
-    @Binding var selectedRaw: String
-    let isSaving: Bool
     let onSelect: (SaveDestinationOption) -> Void
 
     var body: some View {
-        VStack(spacing: 8) {
+        HStack(spacing: 0) {
             ForEach(SaveDestinationOption.allCases) { option in
                 Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     onSelect(option)
                 } label: {
-                    HStack {
+                    VStack(spacing: 6) {
                         Image(systemName: option.icon)
+                            .font(.body.bold())
                         Text(option.rawValue)
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                        if selectedRaw == option.rawValue {
-                            Image(systemName: "checkmark")
-                        }
+                            .font(.caption2.bold())
                     }
                     .foregroundColor(.white)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 14)
-                    .background(Color.white.opacity(0.15))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .frame(width: 88, height: 64)
                 }
-                .disabled(isSaving)
             }
         }
-        .padding(.horizontal, 24)
+        .background(Color.black.opacity(0.82))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
     }
 }
 
@@ -589,6 +697,7 @@ struct GalleryView: View {
     let lastMedia: CapturedMedia?
     @Environment(\.dismiss) private var dismiss
     @State private var items: [CapturedMedia] = []
+    @State private var selectedMedia: CapturedMedia?
 
     private let columns = [
         GridItem(.flexible(), spacing: 2),
@@ -598,64 +707,165 @@ struct GalleryView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: 2) {
-                    ForEach(items) { item in
-                        GalleryCell(media: item)
+            Group {
+                if items.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                            .font(.system(size: 44))
+                            .foregroundColor(.white.opacity(0.4))
+                        Text("No memories yet")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                        Text("Saved photos and videos will appear here.")
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.55))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: 2) {
+                            ForEach(items) { item in
+                                GalleryCell(media: item) {
+                                    selectedMedia = item
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 2)
+                        .padding(.bottom, 24)
                     }
                 }
             }
-            .background(Color.black)
-            .navigationTitle("Memories")
+            .background(Color.black.ignoresSafeArea())
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("Memories")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                         .foregroundColor(.white)
+                        .fontWeight(.semibold)
                 }
             }
-            .toolbarBackground(.black, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbarBackground(Color.black, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
         }
+        .preferredColorScheme(.dark)
         .onAppear {
             items = MediaStorageService.shared.loadAll()
+        }
+        .fullScreenCover(item: $selectedMedia) { media in
+            MemoryDetailView(media: media)
         }
     }
 }
 
 struct GalleryCell: View {
     let media: CapturedMedia
+    let onTap: () -> Void
     @State private var thumbnail: UIImage?
 
     var body: some View {
-        ZStack {
-            if let thumbnail {
-                Image(uiImage: thumbnail)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(minWidth: 0, maxWidth: .infinity)
-                    .aspectRatio(1, contentMode: .fill)
-                    .clipped()
-            } else {
-                Color.gray.opacity(0.3)
-                    .aspectRatio(1, contentMode: .fill)
-            }
+        Button(action: onTap) {
+            ZStack {
+                if let thumbnail {
+                    Image(uiImage: thumbnail)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFill()
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                        .aspectRatio(1, contentMode: .fill)
+                        .clipped()
+                } else {
+                    Color(white: 0.15)
+                        .aspectRatio(1, contentMode: .fill)
+                        .overlay {
+                            ProgressView()
+                                .tint(.white.opacity(0.6))
+                                .scaleEffect(0.8)
+                        }
+                }
 
-            if media.isVideo {
-                VStack {
-                    Spacer()
-                    HStack {
-                        Image(systemName: "play.fill")
-                            .font(.caption2)
-                            .foregroundColor(.white)
+                if media.isVideo {
+                    VStack {
                         Spacer()
+                        HStack {
+                            Image(systemName: "play.fill")
+                                .font(.caption)
+                                .foregroundColor(.white)
+                                .shadow(radius: 2)
+                            Spacer()
+                        }
+                        .padding(8)
                     }
-                    .padding(6)
                 }
             }
         }
-        .onAppear {
-            thumbnail = MediaStorageService.shared.thumbnail(for: media)
+        .buttonStyle(.plain)
+        .task(id: media.id) {
+            let size = MediaStorageService.gridThumbnailPixelSize()
+            let thumb = await Task.detached(priority: .userInitiated) {
+                MediaStorageService.shared.thumbnail(for: media, size: size)
+            }.value
+            thumbnail = thumb
+        }
+    }
+}
+
+struct MemoryDetailView: View {
+    let media: CapturedMedia
+    @Environment(\.dismiss) private var dismiss
+    @State private var fullImage: UIImage?
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                if media.isVideo {
+                    VideoPreviewPlayer(url: media.fileURL)
+                        .ignoresSafeArea()
+                } else if let fullImage {
+                    Image(uiImage: fullImage)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                } else {
+                    ProgressView()
+                        .tint(.white)
+                }
+
+                VStack {
+                    HStack {
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 22, weight: .semibold))
+                                .foregroundColor(.white)
+                                .shadow(color: .black.opacity(0.55), radius: 3, x: 0, y: 1)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Spacer()
+                    }
+                    .padding(.leading, 24)
+                    .padding(.top, geo.safeAreaInsets.top + 12)
+                    Spacer()
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .statusBarHidden(true)
+        .task(id: media.id) {
+            guard !media.isVideo else { return }
+            fullImage = await Task.detached(priority: .userInitiated) {
+                MediaStorageService.shared.fullImage(for: media)
+            }.value
         }
     }
 }
@@ -681,15 +891,15 @@ struct GalleryThumbnailView: View {
                         .foregroundColor(.white.opacity(0.7))
                 }
             }
-            .onAppear {
-                if let media {
-                    thumbnail = MediaStorageService.shared.thumbnail(for: media)
+            .task(id: media?.id) {
+                guard let media else {
+                    thumbnail = nil
+                    return
                 }
-            }
-            .onChange(of: media?.id) { _, _ in
-                if let media {
-                    thumbnail = MediaStorageService.shared.thumbnail(for: media)
-                }
+                let size = CGSize(width: 84 * UIScreen.main.scale, height: 84 * UIScreen.main.scale)
+                thumbnail = await Task.detached(priority: .utility) {
+                    MediaStorageService.shared.thumbnail(for: media, size: size)
+                }.value
             }
     }
 }
@@ -721,139 +931,40 @@ struct RingLightOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            let tint = shade.swiftUIColor
-            let glowStrength = 0.12 + intensity * 0.18
+            let minSide = min(geo.size.width, geo.size.height)
+            let lineWidth = min(38, max(22, minSide * (0.045 + intensity * 0.01)))
+            let white = Color.white.opacity(0.82 + intensity * 0.14)
+            let tint = shade.swiftUIColor.opacity(0.28 + intensity * 0.22)
 
             ZStack {
                 RadialGradient(
                     colors: [
                         Color.clear,
-                        tint.opacity(glowStrength * 0.5),
-                        Color.white.opacity(glowStrength)
+                        tint.opacity(0.35),
+                        white.opacity(0.5)
                     ],
                     center: .center,
-                    startRadius: geo.size.width * 0.25,
-                    endRadius: geo.size.width * 0.75
+                    startRadius: minSide * 0.28,
+                    endRadius: minSide * 0.72
                 )
+
+                RoundedRectangle(cornerRadius: 0)
+                    .strokeBorder(tint, lineWidth: lineWidth)
+                    .blur(radius: lineWidth * 0.32)
 
                 RoundedRectangle(cornerRadius: 0)
                     .strokeBorder(
                         LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.9),
-                                tint.opacity(0.4),
-                                Color.white.opacity(0.9)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
+                            colors: [white, tint, white],
+                            startPoint: .top,
+                            endPoint: .bottom
                         ),
-                        lineWidth: 28
+                        lineWidth: lineWidth * 0.82
                     )
-                    .blur(radius: 12)
+                    .blur(radius: lineWidth * 0.06)
             }
         }
-    }
-}
-
-struct CameraStatusOverlay: View {
-    let message: String
-    var onDemoPhoto: ((Data) -> Void)? = nil
-
-    @State private var pickedItem: PhotosPickerItem?
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "camera.fill")
-                .font(.largeTitle)
-                .foregroundColor(.white)
-            Text(message)
-                .font(.subheadline)
-                .foregroundColor(.white)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-
-            #if targetEnvironment(simulator)
-            if let onDemoPhoto {
-                PhotosPicker(selection: $pickedItem, matching: .images) {
-                    Text("Import test photo")
-                        .font(.subheadline.bold())
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(Color.white)
-                        .clipShape(Capsule())
-                }
-                .onChange(of: pickedItem) { _, item in
-                    Task {
-                        guard let item,
-                              let data = try? await item.loadTransferable(type: Data.self) else { return }
-                        await MainActor.run { onDemoPhoto(data) }
-                    }
-                }
-            }
-            #endif
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.55))
-    }
-}
-
-struct FlashSettingsPanel: View {
-    @ObservedObject var model: CameraViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Ring Light")
-                .font(.caption.bold())
-                .foregroundColor(.white.opacity(0.7))
-
-            HStack(spacing: 8) {
-                ForEach(RingLightShade.allCases) { shade in
-                    Button { model.selectRingLightShade(shade) } label: {
-                        Circle()
-                            .fill(shade.swiftUIColor)
-                            .frame(width: 28, height: 28)
-                            .overlay(
-                                Circle()
-                                    .stroke(
-                                        model.ringLightShade == shade ? Color.yellow : Color.clear,
-                                        lineWidth: 2
-                                    )
-                            )
-                    }
-                }
-            }
-
-            Slider(
-                value: Binding(
-                    get: { model.ringLightIntensity },
-                    set: { model.ringLightIntensity = $0; model.updateRingLightIntensity() }
-                ),
-                in: 0.45...1.0
-            )
-            .tint(.yellow)
-
-            Divider().background(Color.white.opacity(0.2))
-
-            ForEach(FrontFlashStyle.allCases) { style in
-                Button { model.setFrontFlashStyle(style) } label: {
-                    HStack {
-                        Text(style.rawValue)
-                            .font(.subheadline.weight(model.frontFlashStyle == style ? .bold : .regular))
-                            .foregroundColor(.white)
-                        Spacer()
-                        if model.frontFlashStyle == style {
-                            Image(systemName: "checkmark")
-                                .foregroundColor(.yellow)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(16)
-        .frame(width: 200)
-        .background(Color.black.opacity(0.75))
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .allowsHitTesting(false)
     }
 }
 
@@ -870,6 +981,51 @@ struct CountdownOverlay: View {
                 .transition(.scale.combined(with: .opacity))
                 .id(value)
         }
+    }
+}
+
+struct CameraStatusOverlay: View {
+    let message: String
+    var onDemoPhoto: ((Data) -> Void)? = nil
+
+    @State private var pickedItem: PhotosPickerItem?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "camera.fill")
+                .font(.largeTitle)
+            Text(message)
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+
+            #if targetEnvironment(simulator)
+            if let onDemoPhoto {
+                PhotosPicker(selection: $pickedItem, matching: .images) {
+                    Label("Import Photo to Demo", systemImage: "photo.on.rectangle.angled")
+                        .font(.subheadline.bold())
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                        .background(Color.white)
+                        .clipShape(Capsule())
+                }
+                .onChange(of: pickedItem) { _, item in
+                    guard let item else { return }
+                    Task {
+                        if let data = try? await item.loadTransferable(type: Data.self) {
+                            await MainActor.run { onDemoPhoto(data) }
+                        }
+                    }
+                }
+            }
+            #endif
+        }
+        .foregroundColor(.white)
+        .padding(24)
+        .background(Color.black.opacity(0.65))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 24)
     }
 }
 
@@ -916,17 +1072,17 @@ struct PortPreviewView: UIViewRepresentable {
     let inputPort: AVCaptureInput.Port?
     var mirrorVideo: Bool = false
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeUIView(context: Context) -> PreviewUIView {
-        context.coordinator.model = model
         let view = PreviewUIView()
         bindIfNeeded(view: view, coordinator: context.coordinator)
         return view
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
-        context.coordinator.model = model
         bindIfNeeded(view: uiView, coordinator: context.coordinator)
     }
 
@@ -941,12 +1097,10 @@ struct PortPreviewView: UIViewRepresentable {
 
     static func dismantleUIView(_ uiView: PreviewUIView, coordinator: Coordinator) {
         coordinator.bindingKey = nil
-        coordinator.model?.unbindPreviewLayer(uiView.previewLayer)
     }
 
     final class Coordinator {
         var bindingKey: String?
-        weak var model: CameraViewModel?
     }
 }
 
@@ -959,39 +1113,22 @@ class PreviewUIView: UIView {
 struct VideoPreviewPlayer: UIViewControllerRepresentable {
     let url: URL
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
-        let player = AVPlayer(url: url)
-        controller.player = player
+        controller.player = AVPlayer(url: url)
         controller.showsPlaybackControls = false
         controller.videoGravity = .resizeAspect
-        player.play()
-
-        context.coordinator.endObserver = NotificationCenter.default.addObserver(
+        controller.player?.play()
+        NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
-            object: player.currentItem,
+            object: controller.player?.currentItem,
             queue: .main
-        ) { [weak player] _ in
-            player?.seek(to: .zero)
-            player?.play()
+        ) { _ in
+            controller.player?.seek(to: .zero)
+            controller.player?.play()
         }
         return controller
     }
 
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
-
-    static func dismantleUIViewController(_ uiViewController: AVPlayerViewController, coordinator: Coordinator) {
-        if let observer = coordinator.endObserver {
-            NotificationCenter.default.removeObserver(observer)
-            coordinator.endObserver = nil
-        }
-        uiViewController.player?.pause()
-        uiViewController.player = nil
-    }
-
-    final class Coordinator {
-        var endObserver: NSObjectProtocol?
-    }
 }

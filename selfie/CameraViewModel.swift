@@ -39,6 +39,8 @@ class CameraViewModel: NSObject, ObservableObject {
     @Published var showFlashSettingsPanel = false
     @Published var frontFlashStyle: FrontFlashStyle = .ring
     @Published var dualCameraEnabled = false
+    /// When true, front camera is full-screen and back is PiP (Snapchat flip).
+    @Published var dualCameraLayoutSwapped = false
     @Published var showGrid = false
     @Published var flashMode: AVCaptureDevice.FlashMode = .off
     @Published var timerMode: TimerMode = .off
@@ -67,7 +69,7 @@ class CameraViewModel: NSObject, ObservableObject {
     private var recordingStartTime: Date?
     private let maxRecordingDuration: TimeInterval = 60
     private var isPhotoCaptureInProgress = false
-    private var isSessionConfigured = false
+    private var photoCaptureTimeoutWorkItem: DispatchWorkItem?
 
     var activeSession: AVCaptureSession {
         if dualCameraEnabled, isDualCameraActive, let multi = multiCamSession { return multi }
@@ -86,8 +88,29 @@ class CameraViewModel: NSObject, ObservableObject {
         AVCaptureMultiCamSession.isMultiCamSupported
     }
 
+    /// Front ring light in selfie mode and whenever dual-cam is on (Snapchat-style).
+    var usesFrontRingLight: Bool {
+        isUsingFrontCamera || dualCameraEnabled
+    }
+
+    var shouldShowRingLightOverlay: Bool {
+        ringLightEnabled
+            && frontFlashStyle == .ring
+            && (isUsingFrontCamera || (dualCameraEnabled && isDualCameraActive))
+    }
+
+    var dualCamMainPort: AVCaptureInput.Port? {
+        guard dualCameraEnabled, isDualCameraActive else { return nil }
+        return dualCameraLayoutSwapped ? frontCameraPort : backCameraPort
+    }
+
+    var dualCamPiPPort: AVCaptureInput.Port? {
+        guard dualCameraEnabled, isDualCameraActive else { return nil }
+        return dualCameraLayoutSwapped ? backCameraPort : frontCameraPort
+    }
+
     var flashIcon: String {
-        if isUsingFrontCamera {
+        if usesFrontRingLight {
             return ringLightEnabled ? "bolt.fill" : "bolt.slash.fill"
         }
         switch flashMode {
@@ -99,7 +122,7 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     var isFlashActive: Bool {
-        if isUsingFrontCamera { return ringLightEnabled }
+        if usesFrontRingLight { return ringLightEnabled }
         return flashMode != .off
     }
 
@@ -141,57 +164,15 @@ class CameraViewModel: NSObject, ObservableObject {
         }
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
         sessionQueue.async { [weak self] in
-            guard let self else { return }
-            if self.isSessionConfigured, self.session.isRunning {
-                DispatchQueue.main.async { self.isCameraReady = self.hasActivePhotoConnection() }
-                return
-            }
-            if self.isSessionConfigured, !self.session.isRunning, !self.dualCameraEnabled {
-                self.session.startRunning()
-                DispatchQueue.main.async {
-                    self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
-                }
-                return
-            }
-            self.configureSession()
+            self?.configureSession()
         }
     }
 
-    /// Releases timers, preview connections, and camera sessions when leaving the camera screen.
-    func teardownCaptureResources() {
-        countdownCancellable?.cancel()
-        countdownCancellable = nil
-        timerCancellable?.cancel()
-        timerCancellable = nil
-        zoomHideTask?.cancel()
-        zoomHideTask = nil
-        recordingTimer?.invalidate()
-        recordingTimer = nil
-        recordingStartTime = nil
-        dualCamSwitchToken = UUID()
-
-        if isRecording {
-            stopVideoRecording()
-        }
-
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            self.removeAllPreviewBindings()
-            if self.isDualCameraActive, let multi = self.multiCamSession {
-                multi.stopRunning()
-            }
-            if self.session.isRunning {
-                self.session.stopRunning()
-            }
-            self.isSessionConfigured = false
-        }
-
-        DispatchQueue.main.async {
-            self.isRecording = false
-            self.isRecordingLocked = false
-            self.isReconfiguringSession = false
-            self.isProcessingCapture = false
-        }
+    private func configurePhotoOutput(_ output: AVCapturePhotoOutput) {
+        output.maxPhotoQualityPrioritization = .balanced
+        output.isDepthDataDeliveryEnabled = false
+        output.isPortraitEffectsMatteDeliveryEnabled = false
+        output.isHighResolutionCaptureEnabled = false
     }
 
     private func configureSession() {
@@ -223,7 +204,6 @@ class CameraViewModel: NSObject, ObservableObject {
         applyMirroring()
         session.commitConfiguration()
         session.startRunning()
-        isSessionConfigured = true
 
         DispatchQueue.main.async {
             self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
@@ -240,6 +220,7 @@ class CameraViewModel: NSObject, ObservableObject {
                 self.cameraStatusMessage = "Camera failed to start."
                 #endif
             }
+            self.applyRingLightScreenBoost()
         }
     }
 
@@ -272,26 +253,6 @@ class CameraViewModel: NSObject, ObservableObject {
         return false
     }
 
-    private func configurePhotoOutput(_ output: AVCapturePhotoOutput) {
-        output.maxPhotoQualityPrioritization = .balanced
-        output.isDepthDataDeliveryEnabled = false
-        output.isPortraitEffectsMatteDeliveryEnabled = false
-        output.isHighResolutionCaptureEnabled = false
-    }
-
-    /// After video recording, restore `.photo` on whichever session is active (single or dual-cam).
-    private func resetActiveSessionToPhotoPreset() {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            let target = self.activeSession
-            target.beginConfiguration()
-            if target.canSetSessionPreset(.photo) {
-                target.sessionPreset = .photo
-            }
-            target.commitConfiguration()
-        }
-    }
-
     private func applyMirroring() {
         // Front camera: mirror preview AND photo/video so saved file matches live view (Snapchat WYSIWYG).
         if let connection = photoOutput.connection(with: .video) {
@@ -320,7 +281,7 @@ class CameraViewModel: NSObject, ObservableObject {
 
     // MARK: - Flash / Ring Light
     func toggleFlashControl() {
-        if isUsingFrontCamera {
+        if usesFrontRingLight {
             ringLightEnabled.toggle()
             if ringLightEnabled {
                 frontFlashStyle = .ring
@@ -362,7 +323,7 @@ class CameraViewModel: NSObject, ObservableObject {
 
     func applyRingLightScreenBoost() {
         DispatchQueue.main.async {
-            if self.isUsingFrontCamera, self.ringLightEnabled, self.frontFlashStyle == .ring {
+            if self.shouldShowRingLightOverlay {
                 ScreenFlashController.shared.applyRingLight(intensity: self.ringLightIntensity)
             } else {
                 ScreenFlashController.shared.restore()
@@ -472,8 +433,41 @@ class CameraViewModel: NSObject, ObservableObject {
         let connection = AVCaptureConnection(inputPorts: [port], output: output)
         guard targetSession.canAddConnection(connection) else { return }
         targetSession.addConnection(connection)
+        connection.isEnabled = true
         if connection.isVideoOrientationSupported {
             connection.videoOrientation = .portrait
+        }
+    }
+
+    /// Photo in dual-cam comes from whichever feed is full-screen (Snapchat flip).
+    private func updateDualCamPhotoCapturePort() {
+        guard isDualCameraActive,
+              let multi = multiCamSession,
+              let backPort = backCameraPort,
+              let frontPort = frontCameraPort else { return }
+
+        let capturePort = dualCameraLayoutSwapped ? frontPort : backPort
+        let mirrorCapture = dualCameraLayoutSwapped
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            multi.beginConfiguration()
+            for connection in multi.connections {
+                if connection.output === self.multiCamPhotoOutput {
+                    multi.removeConnection(connection)
+                }
+            }
+            self.connectOutput(self.multiCamPhotoOutput, to: capturePort, on: multi)
+            if let connection = self.multiCamPhotoOutput.connection(with: .video) {
+                connection.automaticallyAdjustsVideoMirroring = false
+                if connection.isVideoMirroringSupported {
+                    connection.isVideoMirrored = mirrorCapture
+                }
+            }
+            multi.commitConfiguration()
+            DispatchQueue.main.async {
+                self.isCameraReady = self.hasActivePhotoConnection()
+            }
         }
     }
 
@@ -594,12 +588,13 @@ class CameraViewModel: NSObject, ObservableObject {
             self.backCameraPort = backPort
             self.frontCameraPort = frontPort
             self.dualCameraEnabled = true
+            self.dualCameraLayoutSwapped = false
             self.isUsingFrontCamera = false
-            self.showFlashSettingsPanel = false
             self.currentZoom = 1.0
             self.baseZoom = 1.0
             self.previewSessionID = UUID()
             self.isCameraReady = self.hasActivePhotoConnection()
+            self.applyRingLightScreenBoost()
         }
     }
 
@@ -646,10 +641,12 @@ class CameraViewModel: NSObject, ObservableObject {
         reconfigureSingleSession()
 
         DispatchQueue.main.async {
+            self.dualCameraLayoutSwapped = false
             self.backCameraPort = nil
             self.frontCameraPort = nil
             self.previewSessionID = UUID()
             self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
+            self.applyRingLightScreenBoost()
         }
     }
 
@@ -759,9 +756,8 @@ class CameraViewModel: NSObject, ObservableObject {
         applyMirroring()
         session.commitConfiguration()
         session.startRunning()
-        isSessionConfigured = true
         DispatchQueue.main.async {
-            self.isCameraReady = self.session.isRunning
+            self.isCameraReady = self.session.isRunning && self.hasActivePhotoConnection()
             if self.isUsingFrontCamera {
                 self.currentZoom = SnapchatCameraTuning.frontCameraZoomFactor
                 self.baseZoom = SnapchatCameraTuning.frontCameraZoomFactor
@@ -770,8 +766,9 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     private func hasActivePhotoConnection() -> Bool {
+        guard activeSession.isRunning else { return false }
         guard let connection = activePhotoOutput.connection(with: .video) else { return false }
-        return connection.isEnabled && connection.isActive
+        return connection.isEnabled
     }
 
     // MARK: - Capture Photo
@@ -804,18 +801,17 @@ class CameraViewModel: NSObject, ObservableObject {
         }
 
         if #available(iOS 16.0, *) {
-            // Cap capture size to limit memory during PhotoBeautyProcessor pass.
-            let maxDim = output.maxPhotoDimensions
-            let cap = CMVideoDimensions(
-                width: isUsingFrontCamera ? 3024 : 4032,
-                height: isUsingFrontCamera ? 4032 : 3024
-            )
-            settings.maxPhotoDimensions = CMVideoDimensions(
-                width: min(maxDim.width, cap.width),
-                height: min(maxDim.height, cap.height)
-            )
-        } else {
-            settings.isHighResolutionPhotoEnabled = false
+            if capturesFromFrontCamera {
+                // Slightly lower resolution — less sensor grit, closer to Snap capture weight.
+                let maxDim = output.maxPhotoDimensions
+                let cap = CMVideoDimensions(width: 3024, height: 4032)
+                settings.maxPhotoDimensions = CMVideoDimensions(
+                    width: min(maxDim.width, cap.width),
+                    height: min(maxDim.height, cap.height)
+                )
+            } else {
+                settings.maxPhotoDimensions = output.maxPhotoDimensions
+            }
         }
         if #available(iOS 13.0, *) {
             settings.isAutoVirtualDeviceFusionEnabled = false
@@ -826,31 +822,59 @@ class CameraViewModel: NSObject, ObservableObject {
         return settings
     }
 
-    private func performPhotoCapture(completion: @escaping (Data?) -> Void) {
+    private func performPhotoCapture(completion: @escaping (Data?) -> Void, attempt: Int = 0) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
 
-            if !self.activeSession.isRunning, !self.dualCameraEnabled {
-                self.reconfigureSingleSession()
+            if self.isPhotoCaptureInProgress {
+                DispatchQueue.main.async { completion(nil) }
+                return
             }
 
-            guard !self.isReconfiguringSession,
-                  self.activeSession.isRunning,
-                  self.hasActivePhotoConnection(),
-                  !self.isPhotoCaptureInProgress,
-                  let settings = self.makePhotoSettings() else {
+            if self.isReconfiguringSession {
+                if attempt < 25 {
+                    self.sessionQueue.asyncAfter(deadline: .now() + 0.12) {
+                        self.performPhotoCapture(completion: completion, attempt: attempt + 1)
+                    }
+                    return
+                }
                 DispatchQueue.main.async {
-                    self.isPhotoCaptureInProgress = false
-                    self.showScreenFlash = false
-                    self.cameraStatusMessage = self.isCameraReady
-                        ? "Could not take photo. Try again or restart the app."
-                        : self.cameraStatusMessage
+                    self.cameraStatusMessage = "Camera is busy. Try again."
                     completion(nil)
                 }
                 return
             }
 
-            let useScreenFlash = self.isUsingFrontCamera && self.ringLightEnabled && self.frontFlashStyle == .regular
+            if !self.activeSession.isRunning {
+                if self.isDualCameraActive {
+                    self.multiCamSession?.startRunning()
+                } else {
+                    self.reconfigureSingleSession()
+                }
+            }
+
+            guard self.activeSession.isRunning,
+                  self.hasActivePhotoConnection(),
+                  let settings = self.makePhotoSettings() else {
+                if attempt < 20 {
+                    self.sessionQueue.asyncAfter(deadline: .now() + 0.12) {
+                        self.performPhotoCapture(completion: completion, attempt: attempt + 1)
+                    }
+                    return
+                }
+                DispatchQueue.main.async {
+                    self.isPhotoCaptureInProgress = false
+                    self.showScreenFlash = false
+                    self.cameraStatusMessage = "Could not take photo. Try again."
+                    completion(nil)
+                }
+                return
+            }
+
+            let useScreenFlash = self.shouldShowRingLightOverlay == false
+                && self.ringLightEnabled
+                && self.frontFlashStyle == .regular
+                && self.usesFrontRingLight
 
             if useScreenFlash {
                 DispatchQueue.main.async { self.showScreenFlash = true }
@@ -858,21 +882,49 @@ class CameraViewModel: NSObject, ObservableObject {
 
             let captureDelay: TimeInterval = useScreenFlash ? 0.1 : 0
             self.sessionQueue.asyncAfter(deadline: .now() + captureDelay) { [weak self] in
-                guard let self,
-                      self.hasActivePhotoConnection(),
-                      !self.isPhotoCaptureInProgress else {
+                guard let self else {
+                    DispatchQueue.main.async { completion(nil) }
+                    return
+                }
+
+                guard self.hasActivePhotoConnection(),
+                      let readySettings = self.makePhotoSettings() else {
                     DispatchQueue.main.async {
-                        self?.showScreenFlash = false
-                        self?.cameraStatusMessage = "The iOS Simulator has no camera. Connect a real iPhone to test capture."
+                        self.showScreenFlash = false
+                        self.cameraStatusMessage = "Could not take photo. Try again."
                         completion(nil)
                     }
                     return
                 }
+
                 self.isPhotoCaptureInProgress = true
                 self.photoCompletion = completion
-                self.activePhotoOutput.capturePhoto(with: settings, delegate: self)
+                self.schedulePhotoCaptureTimeout()
+                self.activePhotoOutput.capturePhoto(with: readySettings, delegate: self)
             }
         }
+    }
+
+    private func schedulePhotoCaptureTimeout() {
+        photoCaptureTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isPhotoCaptureInProgress else { return }
+            self.isPhotoCaptureInProgress = false
+            DispatchQueue.main.async {
+                self.showScreenFlash = false
+                self.applyRingLightScreenBoost()
+                self.cameraStatusMessage = "Photo timed out. Try again."
+                self.photoCompletion?(nil)
+                self.photoCompletion = nil
+            }
+        }
+        photoCaptureTimeoutWorkItem = work
+        sessionQueue.asyncAfter(deadline: .now() + 12, execute: work)
+    }
+
+    private func cancelPhotoCaptureTimeout() {
+        photoCaptureTimeoutWorkItem?.cancel()
+        photoCaptureTimeoutWorkItem = nil
     }
 
     private func startCountdown(from seconds: Int, action: @escaping () -> Void) {
@@ -925,7 +977,6 @@ class CameraViewModel: NSObject, ObservableObject {
         guard activeMovieOutput.isRecording else { return }
         activeMovieOutput.stopRecording()
         stopRecordingTimer()
-        resetActiveSessionToPhotoPreset()
         DispatchQueue.main.async {
             self.isRecording = false
             self.isRecordingLocked = false
@@ -961,12 +1012,18 @@ class CameraViewModel: NSObject, ObservableObject {
 
     // MARK: - Camera Controls
     func flipCamera() {
-        guard !dualCameraEnabled, !isReconfiguringSession else { return }
+        if dualCameraEnabled && isDualCameraActive {
+            dualCameraLayoutSwapped.toggle()
+            previewSessionID = UUID()
+            updateDualCamPhotoCapturePort()
+            applyRingLightScreenBoost()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
+
+        guard !isReconfiguringSession else { return }
         isUsingFrontCamera.toggle()
         if !isUsingFrontCamera {
-            ringLightEnabled = false
-            showFlashSettingsPanel = false
-        } else if ringLightEnabled {
             showFlashSettingsPanel = false
         }
         applyRingLightScreenBoost()
@@ -1010,8 +1067,12 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     /// True when we must mirror in software because the photo connection couldn't mirror at capture.
+    private var capturesFromFrontCamera: Bool {
+        isUsingFrontCamera || (isDualCameraActive && dualCameraLayoutSwapped)
+    }
+
     private func needsPostCaptureMirrorFallback() -> Bool {
-        guard isUsingFrontCamera else { return false }
+        guard capturesFromFrontCamera else { return false }
         guard let connection = activePhotoOutput.connection(with: .video) else { return true }
         return !connection.isVideoMirroringSupported || !connection.isVideoMirrored
     }
@@ -1054,7 +1115,9 @@ class CameraViewModel: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self, let device = self.videoInput?.device else { return }
             let maxZoom = min(device.activeFormat.videoMaxZoomFactor, 10)
-            let minZoom = max(device.minAvailableVideoZoomFactor, 1.0)
+            let minZoom: CGFloat = self.isUsingFrontCamera
+                ? SnapchatCameraTuning.frontCameraZoomFactor
+                : max(device.minAvailableVideoZoomFactor, 1.0)
             let newZoom = max(minZoom, min(self.baseZoom * factor, maxZoom))
 
             do {
@@ -1168,10 +1231,12 @@ extension CameraViewModel: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
-        DispatchQueue.main.async {
-            self.isPhotoCaptureInProgress = false
-            if let error {
+        if let error {
+            sessionQueue.async { self.cancelPhotoCaptureTimeout() }
+            DispatchQueue.main.async {
+                self.isPhotoCaptureInProgress = false
                 self.showScreenFlash = false
+                self.applyRingLightScreenBoost()
                 self.cameraStatusMessage = "Photo capture failed: \(error.localizedDescription)"
                 self.photoCompletion?(nil)
                 self.photoCompletion = nil
@@ -1183,37 +1248,41 @@ extension CameraViewModel: AVCapturePhotoCaptureDelegate {
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         guard error == nil, let rawData = photo.fileDataRepresentation() else {
+            sessionQueue.async { self.cancelPhotoCaptureTimeout() }
             DispatchQueue.main.async {
+                self.isPhotoCaptureInProgress = false
+                self.showScreenFlash = false
+                self.applyRingLightScreenBoost()
+                self.cameraStatusMessage = "Could not process photo. Try again."
                 self.photoCompletion?(nil)
                 self.photoCompletion = nil
             }
             return
         }
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+        sessionQueue.async { self.cancelPhotoCaptureTimeout() }
+        DispatchQueue.main.async {
             self.isPhotoCaptureInProgress = false
             self.showScreenFlash = false
             self.applyRingLightScreenBoost()
             self.isProcessingCapture = true
+        }
 
-            let isFront = self.isUsingFrontCamera
-            let needsMirrorFallback = self.needsPostCaptureMirrorFallback()
-            DispatchQueue.global(qos: .utility).async {
-                let data = autoreleasepool {
-                    PhotoBeautyProcessor.prepareSnapchatPhoto(
-                        from: rawData,
-                        isFrontCamera: isFront,
-                        applyMirrorFallback: needsMirrorFallback
-                    )
-                }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let mirrorFront = self.capturesFromFrontCamera
+            let needsMirrorFallback = mirrorFront && self.needsPostCaptureMirrorFallback()
+            let data = PhotoBeautyProcessor.prepareSnapchatPhoto(
+                from: rawData,
+                isFrontCamera: mirrorFront,
+                applyMirrorFallback: needsMirrorFallback
+            )
 
-                DispatchQueue.main.async {
-                    self.isProcessingCapture = false
-                    self.pendingPreview = PendingCapture(photoData: data, videoURL: nil, isVideo: false)
-                    self.photoCompletion?(data)
-                    self.photoCompletion = nil
-                }
+            DispatchQueue.main.async {
+                self.isProcessingCapture = false
+                self.pendingPreview = PendingCapture(photoData: data, videoURL: nil, isVideo: false)
+                self.photoCompletion?(data)
+                self.photoCompletion = nil
             }
         }
     }
@@ -1225,7 +1294,11 @@ extension CameraViewModel: AVCaptureFileOutputRecordingDelegate {
                     didFinishRecordingTo outputFileURL: URL,
                     from connections: [AVCaptureConnection],
                     error: Error?) {
-        resetActiveSessionToPhotoPreset()
+        sessionQueue.async {
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
+            self.session.commitConfiguration()
+        }
 
         guard error == nil else {
             try? FileManager.default.removeItem(at: outputFileURL)
@@ -1293,4 +1366,3 @@ enum FrontFlashStyle: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 }
-
