@@ -17,13 +17,6 @@ struct ContentView: View {
             // Camera preview
             CameraPreviewContainer(model: cameraModel)
                 .ignoresSafeArea()
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        if cameraModel.showFlashSettingsPanel {
-                            cameraModel.dismissFlashSettingsPanel()
-                        }
-                    }
-                )
                 .gesture(
                     MagnificationGesture()
                         .onChanged { cameraModel.zoom(factor: $0) }
@@ -33,6 +26,9 @@ struct ContentView: View {
                     cameraModel.flipCamera()
                 }
                 .onTapGesture(count: 1, coordinateSpace: .local) { location in
+                    if cameraModel.showFlashSettingsPanel {
+                        cameraModel.dismissFlashSettingsPanel()
+                    }
                     cameraModel.focus(at: location)
                 }
 
@@ -78,39 +74,31 @@ struct ContentView: View {
 
             // Main UI (hidden during capture preview)
             if cameraModel.pendingPreview == nil {
-                VStack(spacing: 0) {
-                    TopBarView(model: cameraModel)
-                    Spacer()
-                    BottomBarView(model: cameraModel, showGallery: $showGallery)
-                }
-
-                // Flash settings popup (top-right, Snapchat style)
-                if cameraModel.showFlashSettingsPanel && cameraModel.usesFrontRingLight {
-                    FlashSettingsPanel(model: cameraModel)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                        .padding(.top, 88)
-                        .padding(.trailing, 58)
-                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                        .zIndex(20)
-                }
-
-                if cameraModel.showFlashSettingsPanel {
-                    VStack {
-                        Spacer()
-                        Text("Tap anywhere on Camera to dismiss")
-                            .font(.caption)
-                            .foregroundColor(.white.opacity(0.55))
-                            .padding(.bottom, 130)
+                ZStack {
+                    // Tap anywhere on camera to close ring-light customization
+                    if cameraModel.showFlashSettingsPanel && cameraModel.isFlashActive {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .ignoresSafeArea()
+                            .onTapGesture {
+                                cameraModel.dismissFlashSettingsPanel()
+                            }
+                            .zIndex(0)
                     }
-                    .allowsHitTesting(false)
-                    .zIndex(19)
-                }
 
-                // Right sidebar controls (Snapchat style)
-                HStack {
-                    Spacer()
-                    RightSidebarView(model: cameraModel)
-                        .padding(.trailing, 12)
+                    VStack(spacing: 0) {
+                        TopBarView(model: cameraModel)
+                        Spacer()
+                        BottomBarView(model: cameraModel, showGallery: $showGallery)
+                    }
+                    .zIndex(1)
+
+                    HStack {
+                        Spacer()
+                        RightSidebarView(model: cameraModel)
+                            .padding(.trailing, 12)
+                    }
+                    .zIndex(2)
                 }
             }
 
@@ -138,6 +126,7 @@ struct ContentView: View {
                         .tint(.white)
                         .scaleEffect(1.2)
                 }
+                .allowsHitTesting(false)
                 .zIndex(150)
             }
 
@@ -263,7 +252,7 @@ struct RightSidebarView: View {
 
     var body: some View {
         VStack(spacing: 22) {
-            // Flash at top of sidebar (Snapchat layout)
+            // Flash pill (Snapchat: bolt, then customization icon slides in below when on)
             VStack(spacing: 10) {
                 Button {
                     model.toggleFlashControl()
@@ -277,7 +266,7 @@ struct RightSidebarView: View {
                         .clipShape(Circle())
                 }
 
-                if model.usesFrontRingLight {
+                if model.usesFrontRingLight && model.isFlashActive {
                     Button {
                         model.toggleFlashSettingsPanel()
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -287,25 +276,34 @@ struct RightSidebarView: View {
                             .foregroundColor(model.showFlashSettingsPanel ? .yellow : .white)
                             .frame(width: 36, height: 28)
                     }
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
             .padding(.vertical, 8)
             .padding(.horizontal, 6)
             .background(Color.black.opacity(0.35))
             .clipShape(Capsule())
+            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: model.isFlashActive)
+            .overlay(alignment: .leading) {
+                if model.showFlashSettingsPanel && model.isFlashActive {
+                    FlashSettingsPanel(model: model)
+                        .offset(x: -228)
+                        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .trailing)))
+                }
+            }
+            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: model.showFlashSettingsPanel)
 
-            SidebarButton(icon: model.timerIcon, label: "Timer", isActive: model.timerMode != .off) {
+            SidebarButton(icon: model.timerIcon, isActive: model.timerMode != .off) {
                 model.cycleTimer()
             }
 
-            SidebarButton(icon: "grid", label: "Grid", isActive: model.showGrid) {
+            SidebarButton(icon: "grid", isActive: model.showGrid) {
                 model.toggleGrid()
             }
 
             if model.supportsDualCamera {
                 SidebarButton(
                     icon: "camera.on.rectangle.fill",
-                    label: "Dual",
                     isActive: model.dualCameraEnabled
                 ) {
                     model.toggleDualCamera()
@@ -642,6 +640,7 @@ struct FlashSettingsPanel: View {
         .frame(width: 220)
         .background(Color(white: 0.15).opacity(0.92))
         .clipShape(RoundedRectangle(cornerRadius: 14))
+        .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
     }
 }
 
@@ -964,6 +963,7 @@ struct CountdownOverlay: View {
                 .transition(.scale.combined(with: .opacity))
                 .id(value)
         }
+        .allowsHitTesting(false)
     }
 }
 
@@ -1052,21 +1052,16 @@ struct ControlButton: View {
 
 struct SidebarButton: View {
     let icon: String
-    let label: String
     var isActive: Bool = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 22))
-                    .foregroundColor(isActive ? .yellow : .white)
-                    .shadow(color: .black.opacity(0.4), radius: 2)
-                Text(label)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.white.opacity(0.85))
-            }
+            Image(systemName: icon)
+                .font(.system(size: 22))
+                .foregroundColor(isActive ? .yellow : .white)
+                .shadow(color: .black.opacity(0.4), radius: 2)
+                .frame(width: 44, height: 44)
         }
     }
 }

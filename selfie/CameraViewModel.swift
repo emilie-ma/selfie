@@ -395,6 +395,9 @@ class CameraViewModel: NSObject, ObservableObject {
     func toggleFlashControl() {
         if usesFrontRingLight {
             ringLightEnabled.toggle()
+            if !ringLightEnabled {
+                showFlashSettingsPanel = false
+            }
             applyRingLightScreenBoost()
         } else {
             toggleFlash()
@@ -404,6 +407,7 @@ class CameraViewModel: NSObject, ObservableObject {
     }
 
     func toggleFlashSettingsPanel() {
+        guard usesFrontRingLight, ringLightEnabled else { return }
         showFlashSettingsPanel.toggle()
     }
 
